@@ -13,7 +13,7 @@ import pkg_resources
 from pathlib import Path
 from loguru import logger
 from eternal_zoo.config import DEFAULT_CONFIG
-from eternal_zoo.utils import wait_for_health
+from eternal_zoo.utils import wait_for_health, is_jetson, get_cuda_memory_jetson
 from typing import Optional, Dict, Any, List
 
 class EternalZooServiceError(Exception):
@@ -135,6 +135,15 @@ class EternalZooManager:
 
             if not config.get("on_demand", False):
                 try:
+                    # Memory validation before starting subprocess
+                    model_memory_gb = self._estimate_model_ram_gb(ai_service)
+                    available_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+                    logger.info(f"Memory check for {config.get('model_name', 'unknown')}: required={model_memory_gb:.2f}GB, available RAM={available_ram_gb:.2f}GB")
+
+                    if available_ram_gb < model_memory_gb:
+                        logger.error(f"Insufficient RAM to start model: need {model_memory_gb:.2f}GB, have {available_ram_gb:.2f}GB")
+                        return False
+
                     # append port and host to the running_ai_command
                     running_ai_command.extend(["--port", str(local_model_port), "--host", host])
                     with open(self.ai_log_file, 'w') as stderr_log:
@@ -223,31 +232,31 @@ class EternalZooManager:
             os.remove(self.service_info_file)
             logger.info(f"Service info file removed: {self.service_info_file}")
         
-        # always force kill the service
+        # attempt graceful shutdown first, fallback to force if needed
         ai_services = []
         ai_service_stop = False
         api_service_stop = False
-        
+
         if self.ai_service_file.exists():
             with open(self.ai_service_file, 'rb') as f:
                 ai_services = msgpack.unpack(f)
             for ai_service in ai_services:
                 pid = ai_service.get("pid", None)
                 if pid and psutil.pid_exists(pid):
-                    ai_service_stop = self._terminate_process_safely(pid, "EternalZoo AI Service", force=True)
-            
+                    ai_service_stop = self._terminate_process_safely(pid, "EternalZoo AI Service", force=False)
+
             if ai_service_stop:
                 os.remove(self.ai_service_file)
                 logger.info(f"AI service metadata file removed: {self.ai_service_file}")
             else:
                 logger.warning("Failed to stop EternalZoo AI Service")
-        
+
         if self.api_service_file.exists():
             with open(self.api_service_file, 'rb') as f:
                 api_service = msgpack.unpack(f)
             pid = api_service.get("pid", None)
             if pid and psutil.pid_exists(pid):
-                api_service_stop = self._terminate_process_safely(pid, "EternalZoo API Service", force=True)
+                api_service_stop = self._terminate_process_safely(pid, "EternalZoo API Service", force=False)
             
             if api_service_stop:
                 os.remove(self.api_service_file)
@@ -255,6 +264,159 @@ class EternalZooManager:
             else:
                 logger.warning("Failed to stop EternalZoo API Service")
         
+        # Verify GPU memory cleanup if applicable
+        if not self._verify_cuda_memory_released():
+            logger.warning("GPU memory may not have been fully released after shutdown")
+            # Attempt cleanup
+            import asyncio
+            asyncio.run(self._attempt_cuda_reset())
+
+        return True
+
+    def _get_gpu_memory_usage(self) -> str:
+        """Get current GPU memory usage as a formatted string. Returns 'unavailable' if checks fail."""
+        try:
+            # Try pynvml first
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            used_mb = info.used / (1024 * 1024)
+            total_mb = info.total / (1024 * 1024)
+            return f"{used_mb:.1f}MB/{total_mb:.1f}MB"
+        except ImportError:
+            # Fallback to nvidia-smi
+            try:
+                import subprocess
+                result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'],
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    if lines:
+                        used_mb, total_mb = map(int, lines[0].split(', '))
+                        return f"{used_mb}MB/{total_mb}MB"
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError):
+                pass
+        except Exception as e:
+            logger.debug(f"GPU memory check failed: {e}")
+
+        return "unavailable"
+
+    async def _attempt_cuda_reset(self) -> bool:
+        """Attempt CUDA device reset to force memory cleanup. Returns True if successful."""
+        logger.info("Attempting CUDA device reset for memory cleanup...")
+
+        # Jetson-specific handling
+        if is_jetson():
+            logger.warning("Jetson detected - CUDA memory may persist after process termination. Attempting cleanup.")
+            # For Jetson, try driver reload if we have sudo
+            try:
+                import subprocess
+                # Check if we have sudo
+                sudo_check = subprocess.run(['sudo', '-n', 'true'], capture_output=True, timeout=5)
+                if sudo_check.returncode == 0:
+                    logger.info("Attempting NVIDIA driver reload on Jetson...")
+                    # Unload and reload NVIDIA driver
+                    unload = await asyncio.create_subprocess_exec(
+                        'sudo', 'rmmod', 'nvidia',
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await asyncio.wait_for(unload.wait(), timeout=10.0)
+                    await asyncio.sleep(0.5)
+                    load = await asyncio.create_subprocess_exec(
+                        'sudo', 'nvidia-smi', '-a',  # This should reload the driver
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    await asyncio.wait_for(load.wait(), timeout=10.0)
+                    logger.info("NVIDIA driver reload completed on Jetson")
+                    await asyncio.sleep(1.0)  # Allow time for reload
+                    return True
+                else:
+                    logger.warning("No sudo access for driver reload on Jetson")
+            except (asyncio.TimeoutError, subprocess.CalledProcessError, FileNotFoundError) as e:
+                logger.warning(f"Jetson driver reload failed: {e}")
+            return False  # Don't try other methods on Jetson
+
+        try:
+            # Try pynvml first for device reset
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+            # Try to reset GPU by toggling persistence mode
+            try:
+                current_mode = pynvml.nvmlDeviceGetPersistenceMode(handle)
+                # Toggle persistence mode to force cleanup
+                pynvml.nvmlDeviceSetPersistenceMode(handle, 0)  # Disable
+                await asyncio.sleep(0.1)
+                pynvml.nvmlDeviceSetPersistenceMode(handle, 1)  # Re-enable
+                logger.info("CUDA device reset via pynvml completed")
+                return True
+            except Exception as e:
+                logger.warning(f"pynvml device reset failed: {e}")
+
+        except ImportError:
+            logger.debug("pynvml not available for CUDA reset")
+
+        # Fallback: try nvidia-smi gpu reset
+        try:
+            logger.info("Attempting CUDA reset via nvidia-smi...")
+            result = await asyncio.create_subprocess_exec(
+                'nvidia-smi', '--gpu-reset',
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await asyncio.wait_for(result.wait(), timeout=10.0)
+            if result.returncode == 0:
+                logger.info("CUDA device reset via nvidia-smi completed")
+                await asyncio.sleep(0.5)  # Allow time for reset to take effect
+                return True
+            else:
+                logger.warning(f"nvidia-smi gpu reset failed with return code: {result.returncode}")
+        except (asyncio.TimeoutError, FileNotFoundError) as e:
+            logger.warning(f"nvidia-smi reset unavailable: {e}")
+
+        logger.warning("All CUDA reset methods failed")
+        return False
+
+    def _verify_cuda_memory_released(self) -> bool:
+        """Verify CUDA memory cleanup after shutdown. Returns True if memory appears clean or check unavailable."""
+        # On Jetson, memory checks are unreliable due to unified memory and persistent allocations
+        # Always attempt cleanup on Jetson
+        if is_jetson():
+            logger.info("Jetson detected - CUDA memory verification unreliable, will attempt cleanup")
+            return False  # Force cleanup attempt
+
+        try:
+            # Try pynvml first
+            import pynvml
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            used_mb = info.used / (1024 * 1024)
+            logger.info(f"GPU memory after shutdown: {used_mb:.1f}MB used out of {info.total / (1024*1024):.1f}MB")
+            return used_mb < 500  # Consider clean if less than 500MB used
+        except ImportError:
+            # Fallback to nvidia-smi
+            try:
+                import subprocess
+                result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'],
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    lines = result.stdout.strip().split('\n')
+                    if lines:
+                        used_mb, total_mb = map(int, lines[0].split(', '))
+                        logger.info(f"GPU memory after shutdown: {used_mb}MB used out of {total_mb}MB")
+                        return used_mb < 500
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, ValueError):
+                pass
+        except Exception as e:
+            logger.debug(f"CUDA memory verification failed: {e}")
+
+        # If all checks fail, assume it's clean to avoid false positives
+        logger.debug("CUDA memory verification unavailable - assuming clean")
         return True
 
     def _terminate_process_safely(self, pid: int, process_name: str, timeout: int = 15, use_process_group: bool = True, force: bool = False) -> bool:
@@ -358,7 +520,7 @@ class EternalZooManager:
                     time.sleep(wait_time)
                     elapsed += wait_time
                     wait_time = min(wait_time * 1.5, 2.0)  # Cap at 2 seconds
-                    
+
                     # Check if process became zombie
                     try:
                         if process.status() == psutil.STATUS_ZOMBIE:
@@ -446,7 +608,7 @@ class EternalZooManager:
             logger.error(f"Error terminating {process_name} (PID: {pid}): {e}")
             return False
 
-    async def _terminate_process_safely_async(self, pid: int, process_name: str, timeout: int = 15, use_process_group: bool = True) -> bool:
+    async def _terminate_process_safely_async(self, pid: int, process_name: str, timeout: int = 15, use_process_group: bool = True, force: bool = False) -> bool:
         """
         Async version of _terminate_process_safely for use in async contexts.
         
@@ -491,59 +653,66 @@ class EternalZooManager:
                 pass
             
             # Phase 1: Graceful termination
-            try:
-                if use_process_group:
-                    # Try process group termination first
-                    try:
-                        pgid = os.getpgid(pid)
-                        os.killpg(pgid, signal.SIGTERM)
-                        logger.debug(f"Sent SIGTERM to process group {pgid}")
-                    except (ProcessLookupError, OSError, PermissionError):
-                        # Fall back to individual process termination
+            if not force:
+                try:
+                    if use_process_group:
+                        # Try process group termination first
+                        try:
+                            pgid = os.getpgid(pid)
+                            os.killpg(pgid, signal.SIGTERM)
+                            logger.debug(f"Sent SIGTERM to process group {pgid}")
+                        except (ProcessLookupError, OSError, PermissionError):
+                            # Fall back to individual process termination
+                            process.terminate()
+                            logger.debug(f"Sent SIGTERM to process {pid}")
+
+                            for child in children:
+                                try:
+                                    child.terminate()
+                                    logger.debug(f"Sent SIGTERM to child process {child.pid}")
+                                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                                    pass
+                    else:
+                        # Individual process termination
                         process.terminate()
                         logger.debug(f"Sent SIGTERM to process {pid}")
-                        
+
                         for child in children:
                             try:
                                 child.terminate()
                                 logger.debug(f"Sent SIGTERM to child process {child.pid}")
                             except (psutil.NoSuchProcess, psutil.AccessDenied):
                                 pass
-                else:
-                    # Individual process termination
-                    process.terminate()
-                    logger.debug(f"Sent SIGTERM to process {pid}")
-                    
-                    for child in children:
-                        try:
-                            child.terminate()
-                            logger.debug(f"Sent SIGTERM to child process {child.pid}")
-                        except (psutil.NoSuchProcess, psutil.AccessDenied):
-                            pass
-                            
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                logger.info(f"Process {process_name} disappeared during termination")
-                return True
-            
-            # Wait for graceful termination with async sleep
-            wait_time = 0.1
-            elapsed = 0
-            while elapsed < timeout and psutil.pid_exists(pid):
-                await asyncio.sleep(wait_time)
-                elapsed += wait_time
-                wait_time = min(wait_time * 1.5, 2.0)  # Cap at 2 seconds
-                
-                # Check if process became zombie
-                try:
-                    if process.status() == psutil.STATUS_ZOMBIE:
-                        logger.info(f"{process_name} became zombie, considering stopped")
-                        return True
+
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    logger.info(f"Process {process_name} disappeared during termination")
                     return True
-            
+
+                # Wait for graceful termination with async sleep
+                wait_time = 0.1
+                elapsed = 0
+                while elapsed < timeout and psutil.pid_exists(pid):
+                    await asyncio.sleep(wait_time)
+                    elapsed += wait_time
+                    wait_time = min(wait_time * 1.5, 2.0)  # Cap at 2 seconds
+
+                    # Check if process became zombie
+                    try:
+                        if process.status() == psutil.STATUS_ZOMBIE:
+                            logger.info(f"{process_name} became zombie, considering stopped")
+                            return True
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        return True
+            else:
+                logger.info(f"Force mode enabled - skipping graceful termination for {process_name} (PID: {pid})")
+
             # Phase 2: Force termination if still running
             if psutil.pid_exists(pid):
                 logger.warning(f"Force killing {process_name} (PID: {pid})")
+
+                # Attempt CUDA reset before force kill to ensure GPU memory cleanup
+                await self._attempt_cuda_reset()
+
                 try:
                     # Refresh children list
                     children = []
@@ -552,7 +721,7 @@ class EternalZooManager:
                         children = process.children(recursive=True)
                     except (psutil.NoSuchProcess, psutil.AccessDenied):
                         pass
-                    
+
                     if use_process_group:
                         # Try process group kill
                         try:
@@ -563,7 +732,7 @@ class EternalZooManager:
                             # Fall back to individual kill
                             process.kill()
                             logger.debug(f"Sent SIGKILL to process {pid}")
-                            
+
                             for child in children:
                                 try:
                                     child.kill()
@@ -574,14 +743,14 @@ class EternalZooManager:
                         # Individual process kill
                         process.kill()
                         logger.debug(f"Sent SIGKILL to process {pid}")
-                        
+
                         for child in children:
                             try:
                                 child.kill()
                                 logger.debug(f"Sent SIGKILL to child process {child.pid}")
                             except (psutil.NoSuchProcess, psutil.AccessDenied):
                                 pass
-                                
+
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     logger.info(f"Process {process_name} disappeared during force kill")
                     return True
@@ -1143,10 +1312,17 @@ class EternalZooManager:
             logger.error(self.last_switch_error)
             return False
         
+        # Log memory state before termination
+        pre_term_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+        gpu_memory_before = self._get_gpu_memory_usage()
+        logger.info(f"Memory before model termination: RAM={pre_term_ram_gb:.2f}GB, GPU={gpu_memory_before}")
+
         active_pid = active_ai_service.get("pid", None)
         if active_pid and psutil.pid_exists(active_pid):
             # Terminate current model process first
+            logger.info(f"Terminating active model process (PID: {active_pid})")
             await self._terminate_process_safely_async(active_pid, "EternalZoo AI Service", timeout=self.PROCESS_TERM_TIMEOUT)
+
             # Wait for memory to stabilize up to a short window
             logger.info("Waiting up to 3s for memory to stabilize after termination...")
             start_ts = time.time()
@@ -1158,6 +1334,12 @@ class EternalZooManager:
                 if cur_avail - last_avail > 256 * 1024 * 1024:
                     break
                 last_avail = cur_avail
+
+            # Log memory state after termination
+            post_term_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+            gpu_memory_after_term = self._get_gpu_memory_usage()
+            ram_reclaimed = post_term_ram_gb - pre_term_ram_gb
+            logger.info(f"Memory after model termination: RAM={post_term_ram_gb:.2f}GB (+{ram_reclaimed:.2f}GB), GPU={gpu_memory_after_term}")
         else:
             logger.warning(f"Active model {active_ai_service.get('model_id', 'unknown')} not found")
 
@@ -1211,8 +1393,14 @@ class EternalZooManager:
                     )
                     logger.error(self.last_switch_error)
                     return False
+
             except Exception as e:
                 logger.warning(f"VRAM check skipped/unavailable: {e}")
+
+        # Log memory state before starting new model
+        pre_launch_ram_gb = psutil.virtual_memory().available / (1024 ** 3)
+        gpu_memory_pre_launch = self._get_gpu_memory_usage()
+        logger.info(f"Memory before launching new model: RAM={pre_launch_ram_gb:.2f}GB, GPU={gpu_memory_pre_launch}")
 
         local_model_port = self._get_free_port()
         # avoid mutating stored command in service info

@@ -207,6 +207,11 @@ def parse_args():
         help="🔍 Tensor backend for the model (default: gguf)",
         metavar="BACKEND"
     )
+    run_command.add_argument(
+        "--foreground",
+        action="store_true",
+        help="🖥️  Run in foreground mode (keep CLI running to monitor subprocesses)",
+    )
 
     # Model serve command
     serve_command = model_subparsers.add_parser(
@@ -776,6 +781,17 @@ def handle_run(args):
             sys.exit(1)
 
         print_success(f"Multi-model server started with {len(configs)} models")
+
+        if getattr(args, 'foreground', False):
+            print_info("Running in foreground mode - press Ctrl+C to stop")
+            try:
+                # Keep the process running to prevent subprocess termination in some environments
+                while True:
+                    import time
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print_info("Stopping server...")
+                manager.stop()
         return success
     
     # Handle Hugging Face repository case separately
@@ -799,6 +815,16 @@ def handle_run(args):
         if not success:
             print_error(f"Failed to start model {model_id}")
             sys.exit(1)
+
+        if getattr(args, 'foreground', False):
+            print_info("Running in foreground mode - press Ctrl+C to stop")
+            try:
+                while True:
+                    import time
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print_info("Stopping server...")
+                manager.stop()
         return success
 
     # Handle hash or model_name cases
@@ -846,6 +872,16 @@ def handle_run(args):
     if not success:
         print_error(f"Failed to start model {model_id}")
         sys.exit(1)
+
+    if getattr(args, 'foreground', False):
+        print_info("Running in foreground mode - press Ctrl+C to stop")
+        try:
+            while True:
+                import time
+                time.sleep(1)
+        except KeyboardInterrupt:
+            print_info("Stopping server...")
+            manager.stop()
     return success
 
 
