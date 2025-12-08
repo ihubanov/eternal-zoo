@@ -764,9 +764,23 @@ def handle_run(args):
                 print_warning(f"Failed to load model '{model_key}' from metadata")
                 continue
 
-            # Allow per-model context_length override if provided
+            # Apply YAML config overrides
+            context_override = False
             if "context_length" in model_config:
                 cfg["context_length"] = model_config["context_length"]
+                context_override = True
+
+            # Calculate memory requirements for all models after overrides are applied
+            try:
+                from eternal_zoo.manager import EternalZooManager
+                manager = EternalZooManager()
+                memory_requirements = manager._calculate_model_memory_requirements(cfg)
+                cfg["memory_requirements"] = memory_requirements
+                override_note = " (after context_length override)" if context_override else ""
+                print_info(f"Calculated memory for {model_id}{override_note}: RAM={memory_requirements['ram_gb']:.2f}GB, GPU={memory_requirements['gpu_ram_gb']:.2f}GB")
+            except Exception as e:
+                print_warning(f"Failed to calculate memory requirements for {model_id}: {e}")
+                # Continue without memory requirements - will fall back to on-demand calculation
 
             configs.append(cfg)
 
@@ -939,6 +953,7 @@ def load_model_metadata(model_id, is_main=False) -> tuple[bool, dict | None]:
     is_multimodal = metadata.get("multimodal", False)
     is_lora = metadata.get("lora", False)
     model_name = metadata.get("model_name") or metadata.get("folder_name", model_id)
+    context_length = metadata.get("context_length", DEFAULT_CONFIG.model.DEFAULT_CONTEXT_LENGTH)
     
     # Handle projector path for multimodal models
     projector_path = str(model_dir / f"{model_id}-projector") if is_multimodal else None
@@ -967,9 +982,10 @@ def load_model_metadata(model_id, is_main=False) -> tuple[bool, dict | None]:
         "is_lora": is_lora,
         "architecture": metadata.get("architecture", "flux-dev"),
         "lora_config": lora_config,
-        "context_length": DEFAULT_CONFIG.model.DEFAULT_CONTEXT_LENGTH,
+        "context_length": context_length,
         "backend": hf_data.get("backend", "gguf") if hf_data else "gguf"
     }
+
     return True, config
 
 
